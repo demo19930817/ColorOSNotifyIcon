@@ -336,11 +336,19 @@ fun Number.dpFloat(context: Context) = toFloat() * context.resources.displayMetr
  * 由于 ColorOS 阉割了 [android.R.color.system_accent1_600] 这里取系统壁纸颜色做补偿
  *
  * 从 ColorOS 13 (Android 13) 开始使用系统取色方案
+ *
+ * ColorOS 17 进一步移除了 system_accent1_600 的取色路径，改用 Material 壁纸取色，
+ * 这里做多重兜底：系统资源 → 壁纸取色 → 默认强调色，避免命中灰色默认值导致灰度图标着色错误
  * @return [Int] Android < 13 返回 [wallpaperColor]
  */
 val Context.systemAccentColor
     get() = safeOf(wallpaperColor) {
-        if (isUpperOfAndroidT) resources.colorOf(android.R.color.system_accent1_600) else wallpaperColor
+        if (isUpperOfAndroidT) {
+            runCatching { resources.colorOf(android.R.color.system_accent1_600) }.getOrNull()
+                ?.takeIf { it != 0xFF707173.toInt() && it != 0xFFD8D8D8.toInt() }
+                ?: wallpaperColor.takeIf { it != 0xFF707173.toInt() && it != 0xFFD8D8D8.toInt() }
+                ?: 0xFF4C6EF5.toInt()
+        } else wallpaperColor
     }
 
 /**

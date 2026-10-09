@@ -136,8 +136,16 @@ object SystemUIHooker : YukiBaseHooker() {
     /** 原生存在的类 - 旧版本不存在 */
     private val LegacyNotificationIconAreaControllerImpl by lazyClassOrNull("${PackageName.SYSTEMUI}.statusbar.phone.LegacyNotificationIconAreaControllerImpl")
 
-    /** ColorOS 存在的类 - 旧版本不存在 */
-    private val OplusContrastColorUtilClass by lazyClassOrNull("com.oplusos.util.OplusContrastColorUtil")
+    /** ColorOS 存在的类 - 旧版本不存在（ColorOS 17 已由 com.oplusos.util 迁移至 com.oplus.systemui.utils，此处兼容两个包名） */
+    private val OplusContrastColorUtilClass by lazyClassOrNull(
+        VariousClass(
+            "com.oplus.systemui.utils.OplusContrastColorUtil",
+            "com.oplusos.util.OplusContrastColorUtil"
+        )
+    )
+
+    /** ColorOS 17 灰度图标判断工具类（由 NotificationUtils.isGrayscaleOplus 迁移而来） */
+    private val OpNotificationUtilsClass by lazyClassOrNull("com.oplus.systemui.statusbar.notification.util.OpNotificationUtils")
 
     /** ColorOS 存在的类 - 旧版本不存在 */
     private val OplusNotificationBackgroundViewClass by lazyClassOrNull("com.oplusos.systemui.statusbar.notification.row.OplusNotificationBackgroundView")
@@ -156,6 +164,9 @@ object SystemUIHooker : YukiBaseHooker() {
 
     /** ColorOS 存在的类 - 旧版本不存在 */
     private val OplusNotificationHeaderViewWrapperExImpClass by lazyClassOrNull("com.oplus.systemui.statusbar.notification.row.wrapper.OplusNotificationHeaderViewWrapperExImp")
+
+    /** ColorOS 17 存在的类 - 旧版本不存在（Material 图标着色包装器，通知图标最终着色点） */
+    private val NotificationIconMaterialWrapperClass by lazyClassOrNull("com.oplus.systemui.notification.row.material.wrapper.NotificationIconMaterialWrapper")
 
     /** ColorOS 存在的类 - 旧版本不存在 */
     private val OplusNotificationGroupTemplateWrapperClass by lazyClassOrNull("com.oplus.systemui.notification.row.oplusgroup.OplusNotificationGroupTemplateWrapper")
@@ -297,6 +308,9 @@ object SystemUIHooker : YukiBaseHooker() {
 
     /** 记录已处理过的图标 [ImageView] - 值 true 表示本模块接管，false 表示交还系统；用于拦截判断与避免重复处理 */
     private val moduleStyledIcons = WeakHashMap<ImageView, Boolean>()
+
+    /** 记录 Material 兜底着色点已处理过的图标与通知对应关系，防止视图复用后样式错配与重复重绘 */
+    private val materialStyledNf = WeakHashMap<ImageView, StatusBarNotification>()
 
     /**
      * 通知面板图标内边距比例 (MD3 风格) - 内边距占图标视图尺寸的比例 (0f~0.5f)
@@ -569,6 +583,11 @@ object SystemUIHooker : YukiBaseHooker() {
         iconColor: Int,
         iconView: ImageView
     ) = runInSafe {
+        /** ColorOS 17 会话通知（自带头像）保留原生「头像+角标」布局，主图标不做替换，角标由 [styleRightIconBadge] 处理 */
+        if (nf.notification.largeIcon != null) {
+            moduleStyledIcons[iconView] = false
+            return@runInSafe
+        }
         val realPackageName = if (nf.isOplusPush || isCollapseNotification(nf.packageName, packageName)) nf.packageName else packageName
         compatCustomIcon(context, isGrayscaleIcon, realPackageName).also { customTriple ->
             when {
@@ -695,6 +714,40 @@ object SystemUIHooker : YukiBaseHooker() {
                     iconView = iconView
                 )
             }
+        }
+    }
+
+    /**
+     * 对 ColorOS 17 会话通知的右下角角标应用模块单色样式
+     *
+     * 原生布局为「联系人头像 (mIcon) + 右下角 APP 彩色角标 (mRightIcon)」，此处仅将角标替换为模块单色图标，保留头像
+     * @param headerWrapperExImp [OplusNotificationHeaderViewWrapperExImpClass] 实例
+     */
+    private fun styleRightIconBadge(headerWrapperExImp: Any?) = runInSafe {
+        val rightIcon = headerWrapperExImp?.let { XposedHelpers.getObjectField(it, "mRightIcon") as? ImageView } ?: return@runInSafe
+        if (rightIcon.visibility != View.VISIBLE || rightIcon.drawable == null) return@runInSafe
+        val base = XposedHelpers.callMethod(headerWrapperExImp, "getBase")
+        val row = NotificationViewWrapperClass.resolve().optional().firstFieldOrNull { name = "mRow" }?.of(base)?.get()
+        val nf = ExpandableNotificationRowClass.resolve().optional().firstMethodOrNull { name = "getEntry" }
+            ?.of(row)?.invokeQuietly()?.let {
+                it.asResolver().optional().firstMethodOrNull { name = "getSbn" }?.invoke<StatusBarNotification>()
+            } ?: return@runInSafe
+        val context = rightIcon.context
+        compatCustomIcon(context, isGrayscaleIcon = false, packageName = nf.packageName).let { customTriple ->
+            val glyph = customTriple.first ?: return@runInSafe
+            /** 角标底色优先使用 ANIP 指定色，其次通知自带色，最后白色 */
+            val badgeColor = customTriple.second.takeIf { it != 0 }
+                ?: nf.notification.color.takeIf { it != 0 }
+                ?: 0xFFFFFFFF.toInt()
+            rightIcon.setImageDrawable(
+                CustomIconDrawable(
+                    glyph = glyph,
+                    badgeColor = badgeColor,
+                    glyphColor = Color.WHITE,
+                    cornerRadiusPx = ConfigData.notifyIconCornerSize.dpFloat(context),
+                    paddingRatio = NOTIFY_ICON_PADDING_RATIO_MD3
+                )
+            )
         }
     }
 
@@ -946,6 +999,15 @@ object SystemUIHooker : YukiBaseHooker() {
                 parameters(ImageView::class, OplusContrastColorUtilClass ?: VagueType)
             }?.hook()?.replaceAny { args().first().cast<ImageView>()?.let { isGrayscaleIcon(it.context, it.drawable) } ?: callOriginal() }
         }
+        /**
+         * ColorOS 17 修复：灰度图标判断已迁移到 [OpNotificationUtils.isGrayscaleOplus]（4 参数）
+         * 上游只替换了旧版 NotificationUtils 的 2 参数版本，此处补上新类 4 参数版本的替换
+         */
+        OpNotificationUtilsClass?.resolve()?.optional(silent = true)?.apply {
+            firstMethodOrNull {
+                name = "isGrayscaleOplus"
+            }?.hook()?.replaceAny { args().first().cast<ImageView>()?.let { isGrayscaleIcon(it.context, it.drawable) } ?: callOriginal() }
+        }
         /** 替换状态栏图标 */
         IconManagerClass.resolve().optional().firstMethodOrNull {
             name = "getIconDescriptor"
@@ -1124,7 +1186,11 @@ object SystemUIHooker : YukiBaseHooker() {
                                 }?.invoke<StatusBarNotification>()
                             }.also { nf ->
                                 nf?.notification?.also {
-                                    it.smallIcon.loadDrawable(context)?.also { iconDrawable ->
+                                    /** ColorOS 17 会话通知：主图标保留头像，延迟替换右下角角标为模块单色图标 */
+                                    if (it.largeIcon != null) {
+                                        delayedRun(ms = 400) { styleRightIconBadge(instance) }
+                                        delayedRun(ms = 1200) { styleRightIconBadge(instance) }
+                                    } else it.smallIcon.loadDrawable(context)?.also { iconDrawable ->
                                         compatNotifyIcon(
                                             context = context,
                                             nf = nf,
@@ -1144,7 +1210,12 @@ object SystemUIHooker : YukiBaseHooker() {
                     emptyParameters()
                 }?.hook()?.apply {
                     before { if (moduleStyledIcons[headerIconOf(instance)] == true) resultFalse() }
-                    after { headerIconOf(instance)?.let { styleHeaderIcon(instance) } }
+                    after {
+                        headerIconOf(instance)?.let { styleHeaderIcon(instance) }
+                        /** ColorOS 17 会话通知（头像+角标布局）：延迟替换右下角角标为模块单色图标 */
+                        delayedRun(ms = 400) { styleRightIconBadge(instance) }
+                        delayedRun(ms = 1200) { styleRightIconBadge(instance) }
+                    }
                 }
                 firstMethodOrNull {
                     name = "updateIconRoundness"
@@ -1153,6 +1224,45 @@ object SystemUIHooker : YukiBaseHooker() {
                     before { if (moduleStyledIcons[headerIconOf(instance)] == true) resultNull() }
                     after { headerIconOf(instance)?.let { styleHeaderIcon(instance) } }
                     // after { headerIconOf(instance)?.let { if (!moduleStyledIcons.containsKey(it)) styleHeaderIcon(instance) } }
+                }
+            }
+            /**
+             * ColorOS 17 修复：Material 管线的最终着色点（原生灰调的真正来源）
+             *
+             * applyMaterial / applyNormal 最终全部汇聚到 [NotificationIconMaterialWrapper.applyIconColor]，
+             * 它持有可见图标视图 (CachingIconView) 与 [ExpandableNotificationRow]，是唯一稳定的兜底时机，
+             * 无论此前哪条绑定路径遗漏，都能在这里对可见图标完成模块样式接管并阻断原生灰调
+             */
+            NotificationIconMaterialWrapperClass?.resolve()?.optional()?.apply {
+                firstMethodOrNull {
+                    name = "applyIconColor"
+                }?.hook()?.before {
+                    val iconView = args(index = 1).any() as? ImageView ?: return@before
+                    val row = args(index = 3).any() ?: return@before
+                    val nf = ExpandableNotificationRowClass.resolve().optional().firstMethodOrNull { name = "getEntry" }
+                        ?.of(row)?.invokeQuietly()?.let {
+                            it.asResolver().optional().firstMethodOrNull { name = "getSbn" }?.invoke<StatusBarNotification>()
+                        } ?: return@before
+                    /** 同一条通知重复着色时直接跳过，仅阻断原生灰调，避免重复重绘开销 */
+                    if (materialStyledNf[iconView] === nf && moduleStyledIcons[iconView] == true) {
+                        resultNull()
+                        return@before
+                    }
+                    materialStyledNf[iconView] = nf
+                    val context = iconView.context
+                    nf.notification?.smallIcon?.loadDrawable(context)?.also { iconDrawable ->
+                        compatNotifyIcon(
+                            context = context,
+                            nf = nf,
+                            isGrayscaleIcon = isGrayscaleIcon(context, iconDrawable),
+                            packageName = context.packageName,
+                            drawable = iconDrawable,
+                            iconColor = nf.notification.color,
+                            iconView = iconView
+                        )
+                    }
+                    /** 样式接管成功则阻断原生灰调着色，未接管 (彩色图标/会话通知) 交由原生处理 */
+                    if (moduleStyledIcons[iconView] == true) resultNull()
                 }
             }
 
