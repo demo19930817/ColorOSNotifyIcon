@@ -576,12 +576,16 @@ object SystemUIHooker : YukiBaseHooker() {
         iconView: ImageView
     ) = runInSafe {
         /**
-         * ColorOS 17 MessagingStyle 会话通知（微信等）跳过主图标替换：
-         * 其 mIcon 由系统异步合成 [DrawableWithBadge]（联系人头像 + APP 图标角标），
-         * 若在此替换，同一条通知第二次更新时（系统 lastIcon 缓存不再重新合成）
-         * 会导致头像被单色图标覆盖、头像被挤到右侧 —— 角标单色化由 [swapConversationBadge] 处理
+         * ColorOS 17 会话通知跳过主图标替换，保留原生「联系人头像 + APP 图标角标」布局：
+         * - largeIcon 会话通知：头像在 largeIcon
+         * - 系统认定的会话通知（[Ranking.isConversation]，微信等）：mIcon 由系统异步合成
+         *   [DrawableWithBadge]（头像 + APP 图标角标），角标单色化由 [swapConversationBadge] 处理；
+         *   若在此替换，第二次更新时（系统 lastIcon 缓存不再重新合成）头像会被单色图标覆盖
          */
-        if (nf.notification.extras.containsKey("android.messages")) {
+        if (nf.notification.largeIcon != null ||
+            nf.notification.extras.containsKey("android.messages") ||
+            isConversationNotification(iconView)
+        ) {
             moduleStyledIcons[iconView] = false
             return@runInSafe
         }
@@ -679,12 +683,38 @@ object SystemUIHooker : YukiBaseHooker() {
     }
 
     /**
+     * 判断图标视图所在通知是否为系统认定的会话通知
+     *
+     * 通过 [android.service.notification.NotificationListenerService.Ranking.isConversation]
+     * (公开 API 30+) 判断，这是 ColorOS 决定是否为通知渲染「联系人头像 + 角标」的同一依据。
+     * 微信等应用的通知 extras 中不含 MessagingStyle 标志，只能以此为准
+     * @param view 图标视图（沿视图树向上查找 [ExpandableNotificationRow]）
+     */
+    private fun isConversationNotification(view: View): Boolean = safeOfFalse {
+        var p: Any? = view
+        var row: Any? = null
+        while (p is View) {
+            if (ExpandableNotificationRowClass.isInstance(p)) {
+                row = p
+                break
+            }
+            p = p.parent
+        }
+        row ?: return@safeOfFalse false
+        val entry = ExpandableNotificationRowClass.resolve().optional().firstMethodOrNull { name = "getEntry" }
+            ?.of(row)?.invokeQuietly() ?: return@safeOfFalse false
+        val ranking = entry.asResolver().optional().firstMethodOrNull { name = "getRanking" }?.invokeQuietly<Any>()
+            ?: entry.asResolver().optional().firstFieldOrNull { name = "mRanking" }?.get()
+            ?: return@safeOfFalse false
+        runCatching { ranking.javaClass.getMethod("isConversation").invoke(ranking) as? Boolean }.getOrNull() == true
+    }
+
+    /**
      * 将 [DrawableWithBadge]（会话通知「联系人头像 + APP 图标角标」合成体）中的应用图标角标替换为单色图标
      *
-     * 主 drawable（联系人头像）保持不动，仅替换已存在的角标位。glyph 直接用角标本身（应用图标）经
-     * [CustomIconDrawable] 染色，不依赖 ANIP 名单，避免 glyph 为 null 导致静默失败。
-     * 每个角标位必须使用独立实例 —— [DrawableWithBadge.layoutChildren] 会依次为两个角标位设置
-     * bounds，共享实例会导致 bounds 相互覆盖
+     * 主 drawable（联系人头像）保持不动，仅替换已存在的角标位。glyph 双来源：ANIP 名单单色图标优先，
+     * 未命中时回退到原角标（应用图标）染色。每个角标位必须使用独立实例 ——
+     * [DrawableWithBadge.layoutChildren] 会依次为两个角标位设置 bounds，共享实例会导致 bounds 相互覆盖
      * @param badgeDrawable [DrawableWithBadge] 实例
      * @param context 实例
      * @param packageName APP 包名（用于获取 ANIP 单色图标）
@@ -699,15 +729,16 @@ object SystemUIHooker : YukiBaseHooker() {
              * glyph 双来源：ANIP 名单单色图标优先（用户配置的微信单色图标），
              * 未命中时回退到原角标（应用图标）染色为灰色剪影
              */
-            val glyph = compatCustomIcon(context, isGrayscaleIcon = false, packageName = packageName).first
-                ?: fallbackGlyph
-                ?: return
+            val customTriple = compatCustomIcon(context, isGrayscaleIcon = false, packageName = packageName)
+            val glyph = customTriple.first ?: fallbackGlyph ?: return
+            /** Material3 风格：ANIP 配置色为底 + 白色图标，与普通通知图标风格一致 */
+            val badgeColor = customTriple.second.takeIf { it != 0 } ?: 0xFFFFFFFF.toInt()
             val mono = CustomIconDrawable(
                 glyph = glyph,
-                badgeColor = Color.TRANSPARENT,
+                badgeColor = badgeColor,
                 glyphColor = Color.WHITE,
-                cornerRadiusPx = 0f,
-                paddingRatio = NOTIFY_ICON_PADDING_RATIO_CLASSIC
+                cornerRadiusPx = ConfigData.notifyIconCornerSize.dpFloat(context),
+                paddingRatio = NOTIFY_ICON_PADDING_RATIO_MD3
             )
             mono.setBounds(old.bounds)
             XposedHelpers.setObjectField(badgeDrawable, field, mono)
