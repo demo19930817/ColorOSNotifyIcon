@@ -732,6 +732,9 @@ object SystemUIHooker : YukiBaseHooker() {
             ?.of(row)?.invokeQuietly()?.let {
                 it.asResolver().optional().firstMethodOrNull { name = "getSbn" }?.invoke<StatusBarNotification>()
             } ?: return@runInSafe
+        /** 会话通知 (MessagingStyle) 的 mRightIcon 是联系人头像，不是应用图标角标，跳过以免误替换头像
+         *  判断依据：MessagingStyle 通知的 extras 必含 EXTRA_MESSAGES ("android.messages") */
+        if (nf.notification.extras.containsKey("android.messages")) return@runInSafe
         val context = rightIcon.context
         compatCustomIcon(context, isGrayscaleIcon = false, packageName = nf.packageName).let { customTriple ->
             val glyph = customTriple.first ?: return@runInSafe
@@ -1210,12 +1213,7 @@ object SystemUIHooker : YukiBaseHooker() {
                     emptyParameters()
                 }?.hook()?.apply {
                     before { if (moduleStyledIcons[headerIconOf(instance)] == true) resultFalse() }
-                    after {
-                        headerIconOf(instance)?.let { styleHeaderIcon(instance) }
-                        /** ColorOS 17 会话通知（头像+角标布局）：延迟替换右下角角标为模块单色图标 */
-                        delayedRun(ms = 400) { styleRightIconBadge(instance) }
-                        delayedRun(ms = 1200) { styleRightIconBadge(instance) }
-                    }
+                    after { headerIconOf(instance)?.let { styleHeaderIcon(instance) } }
                 }
                 firstMethodOrNull {
                     name = "updateIconRoundness"
