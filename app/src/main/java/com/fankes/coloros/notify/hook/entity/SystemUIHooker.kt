@@ -718,30 +718,6 @@ object SystemUIHooker : YukiBaseHooker() {
     }
 
     /**
-     * 对 ColorOS 17 会话通知 (MessagingStyle) 提前加载联系人头像到右下角 [mRightIcon]
-     *
-     * 系统原生通过 [getBadge] 协程异步合成「头像 + 应用角标」后才设置到图标视图，
-     * 其中 getPackageIcon() 为异步挂起，导致首条消息头像短暂缺失、第二条才出现。
-     * 头像本身 (smallIcon) 同步可用，这里在通知内容更新时主动加载到 mRightIcon，绕开异步合成延迟
-     * @param headerWrapperExImp [OplusNotificationHeaderViewWrapperExImpClass] 实例
-     */
-    private fun preloadConversationAvatar(headerWrapperExImp: Any?) = runInSafe {
-        val rightIcon = headerWrapperExImp?.let { XposedHelpers.getObjectField(it, "mRightIcon") as? ImageView } ?: return@runInSafe
-        /** 头像已显示则跳过 */
-        if (rightIcon.drawable != null) return@runInSafe
-        val base = XposedHelpers.callMethod(headerWrapperExImp, "getBase")
-        val row = NotificationViewWrapperClass.resolve().optional().firstFieldOrNull { name = "mRow" }?.of(base)?.get()
-        val nf = ExpandableNotificationRowClass.resolve().optional().firstMethodOrNull { name = "getEntry" }
-            ?.of(row)?.invokeQuietly()?.let {
-                it.asResolver().optional().firstMethodOrNull { name = "getSbn" }?.invoke<StatusBarNotification>()
-            } ?: return@runInSafe
-        /** 仅处理 MessagingStyle 会话通知（其 smallIcon 即联系人头像） */
-        if (!nf.notification.extras.containsKey("android.messages")) return@runInSafe
-        val avatar = nf.notification.smallIcon.loadDrawable(rightIcon.context) ?: return@runInSafe
-        rightIcon.setImageDrawable(avatar)
-    }
-
-    /**
      * 对 ColorOS 17 会话通知的右下角角标应用模块单色样式
      *
      * 原生布局为「联系人头像 (mIcon) + 右下角 APP 彩色角标 (mRightIcon)」，此处仅将角标替换为模块单色图标，保留头像
@@ -1205,9 +1181,6 @@ object SystemUIHooker : YukiBaseHooker() {
                     parameterCount = 1
                 }?.hook()?.after {
                     headerIconOf(instance)?.apply {
-                        /** ColorOS 17 会话通知：提前加载联系人头像到 mRightIcon，消除首条消息头像延迟 */
-                        preloadConversationAvatar(instance)
-                        delayedRun(ms = 300) { preloadConversationAvatar(instance) }
                         ExpandableNotificationRowClass.resolve().optional()
                             .firstMethodOrNull { name = "getEntry" }
                             ?.of(args[0])?.invokeQuietly()?.let {
