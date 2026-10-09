@@ -168,6 +168,12 @@ object SystemUIHooker : YukiBaseHooker() {
     /** ColorOS 17 存在的类 - 旧版本不存在（Material 图标着色包装器，通知图标最终着色点） */
     private val NotificationIconMaterialWrapperClass by lazyClassOrNull("com.oplus.systemui.notification.row.material.wrapper.NotificationIconMaterialWrapper")
 
+    /** ColorOS 17 存在的类 - 旧版本不存在（会话通知「头像+应用图标角标」合成 Drawable，主图即联系人头像） */
+    private val DrawableWithBadgeClass by lazyClassOrNull("com.oplus.systemui.notification.utlils.DrawableWithBadge")
+
+    /** ColorOS 17 存在的类 - 旧版本不存在（「头像+应用图标角标」合成工具类） */
+    private val LayerDrawableWithAppIconKtClass by lazyClassOrNull("com.oplus.systemui.notification.row.wrapper.LayerDrawableWithAppIconKt")
+
     /** ColorOS 存在的类 - 旧版本不存在 */
     private val OplusNotificationGroupTemplateWrapperClass by lazyClassOrNull("com.oplus.systemui.notification.row.oplusgroup.OplusNotificationGroupTemplateWrapper")
 
@@ -718,6 +724,56 @@ object SystemUIHooker : YukiBaseHooker() {
     }
 
     /**
+     * 创建会话通知角标的单色图标
+     *
+     * glyph 双来源：ANIP 名单单色图标优先，缺失时回退到 APP 图标（经 [CustomIconDrawable] 染色为灰色剪影），
+     * 避免因 APP 不在 ANIP 名单而静默失败 —— 这是此前替换不生效的根因之一
+     * @param context 实例
+     * @param packageName APP 包名
+     * @param fallbackGlyph ANIP 未命中时使用的兜底 glyph (通常为 APP 图标)
+     * @return [Drawable] or null
+     */
+    private fun monoConversationBadgeOf(context: Context, packageName: String, fallbackGlyph: Drawable?): Drawable? = safeOfNull {
+        val glyph = compatCustomIcon(context, isGrayscaleIcon = false, packageName = packageName).first
+            ?: fallbackGlyph
+            ?: context.appIconOf(packageName)
+            ?: return@safeOfNull null
+        val glyphColor = if (context.isSystemInDarkMode) 0xFFDCDCDC.toInt() else 0xFF707173.toInt()
+        CustomIconDrawable(
+            glyph = glyph,
+            badgeColor = Color.TRANSPARENT,
+            glyphColor = glyphColor,
+            cornerRadiusPx = 0f,
+            paddingRatio = NOTIFY_ICON_PADDING_RATIO_CLASSIC
+        )
+    }
+
+    /**
+     * 将 [DrawableWithBadge]（会话通知「联系人头像 + APP 图标角标」合成体）中的应用图标角标替换为单色图标
+     *
+     * 主 drawable（联系人头像）保持不动；仅替换已存在的角标位，且每个角标位必须使用独立实例 ——
+     * [DrawableWithBadge.layoutChildren] 会依次为两个角标位设置 bounds，共享实例会导致 bounds 相互覆盖
+     * @param badgeDrawable [DrawableWithBadge] 实例
+     * @param context 实例
+     * @param packageName APP 包名
+     * @param fallbackGlyph ANIP 未命中时的兜底 glyph
+     */
+    private fun swapConversationBadge(badgeDrawable: Drawable, context: Context, packageName: String, fallbackGlyph: Drawable?) = runInSafe {
+        fun swap(field: String) {
+            val old = XposedHelpers.getObjectField(badgeDrawable, field) as? Drawable ?: return
+            /** 幂等：已经是模块单色图标则跳过 */
+            if (old is CustomIconDrawable) return
+            val new = monoConversationBadgeOf(context, packageName, fallbackGlyph) ?: return
+            new.setBounds(old.bounds)
+            XposedHelpers.setObjectField(badgeDrawable, field, new)
+        }
+        swap("bottomRightBadge")
+        swap("topRightBadge")
+        runCatching { XposedHelpers.callMethod(badgeDrawable, "relayoutIfHasBounds") }
+        badgeDrawable.invalidateSelf()
+    }
+
+    /**
      * 对 ColorOS 17 会话通知的右下角角标应用模块单色样式
      *
      * 原生布局为「联系人头像 (mIcon) + 右下角 APP 彩色角标 (mRightIcon)」，此处仅将角标替换为模块单色图标，保留头像
@@ -1204,6 +1260,21 @@ object SystemUIHooker : YukiBaseHooker() {
                                             iconView = this
                                         )
                                     }
+                                    /**
+                                     * ColorOS 17 兜底：微信等 MessagingStyle 会话通知的 mIcon 为
+                                     * [DrawableWithBadge]（头像 + APP 图标角标，异步合成），此处延迟检查
+                                     * 并将角标替换为单色图标，头像保持不动
+                                     */
+                                    delayedRun(ms = 600) {
+                                        val badgeDrawable = headerIconOf(instance)?.drawable ?: return@delayedRun
+                                        if (DrawableWithBadgeClass?.isInstance(badgeDrawable) != true) return@delayedRun
+                                        swapConversationBadge(badgeDrawable, context, nf.packageName, context.appIconOf(nf.packageName))
+                                    }
+                                    delayedRun(ms = 1500) {
+                                        val badgeDrawable = headerIconOf(instance)?.drawable ?: return@delayedRun
+                                        if (DrawableWithBadgeClass?.isInstance(badgeDrawable) != true) return@delayedRun
+                                        swapConversationBadge(badgeDrawable, context, nf.packageName, context.appIconOf(nf.packageName))
+                                    }
                                 }
                             }
                     }
@@ -1222,6 +1293,16 @@ object SystemUIHooker : YukiBaseHooker() {
                     before { if (moduleStyledIcons[headerIconOf(instance)] == true) resultNull() }
                     after { headerIconOf(instance)?.let { styleHeaderIcon(instance) } }
                     // after { headerIconOf(instance)?.let { if (!moduleStyledIcons.containsKey(it)) styleHeaderIcon(instance) } }
+                }
+                firstMethodOrNull {
+                    name = "applyExpandedCanvasIconWithBadge"
+                }?.hook()?.after {
+                    /** 合成后的 DrawableWithBadge 应用到视图时替换角标为单色图标（第二道保险） */
+                    val badgeDrawable = args().first().any() as? Drawable ?: return@after
+                    if (DrawableWithBadgeClass?.isInstance(badgeDrawable) != true) return@after
+                    val context = XposedHelpers.callMethod(instance, "getContext") as? Context ?: return@after
+                    val packageName = args(index = 3).any() as? String ?: return@after
+                    swapConversationBadge(badgeDrawable, context, packageName, context.appIconOf(packageName))
                 }
             }
             /**
@@ -1261,6 +1342,21 @@ object SystemUIHooker : YukiBaseHooker() {
                     }
                     /** 样式接管成功则阻断原生灰调着色，未接管 (彩色图标/会话通知) 交由原生处理 */
                     if (moduleStyledIcons[iconView] == true) resultNull()
+                }
+            }
+            /**
+             * ColorOS 17：会话通知「头像 + APP 图标角标」的合成点 (getIconWithBadge → createBackgroundWithAppIcon)，
+             * 合成完成的瞬间即替换角标为单色图标（最早时机，第一道保险）
+             */
+            LayerDrawableWithAppIconKtClass?.resolve()?.optional()?.apply {
+                firstMethodOrNull {
+                    name = "createBackgroundWithAppIcon"
+                }?.hook()?.after {
+                    val badgeDrawable = result as? Drawable ?: return@after
+                    if (DrawableWithBadgeClass?.isInstance(badgeDrawable) != true) return@after
+                    val context = args().first().cast<Context>() ?: return@after
+                    val packageName = args(index = 3).any() as? String ?: return@after
+                    swapConversationBadge(badgeDrawable, context, packageName, context.appIconOf(packageName))
                 }
             }
 
