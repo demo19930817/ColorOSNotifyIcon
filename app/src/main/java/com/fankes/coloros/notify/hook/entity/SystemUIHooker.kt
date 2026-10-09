@@ -589,8 +589,14 @@ object SystemUIHooker : YukiBaseHooker() {
         iconColor: Int,
         iconView: ImageView
     ) = runInSafe {
-        /** ColorOS 17 会话通知（自带头像）保留原生「头像+角标」布局，主图标不做替换，角标由 [styleRightIconBadge] 处理 */
-        if (nf.notification.largeIcon != null) {
+        /**
+         * ColorOS 17 会话通知保留原生「头像+角标」布局，主图标不做替换：
+         * - largeIcon 会话通知：头像在 largeIcon
+         * - MessagingStyle 会话通知（微信等）：头像在 smallIcon，mIcon 由系统异步合成
+         *   [DrawableWithBadge]（头像 + APP 图标角标），角标的单色化由 [swapConversationBadge] 处理；
+         *   若此处替换 mIcon，同一条通知第二次更新时（系统 lastIcon 缓存不再重新合成）会导致整个头像被单色图标覆盖
+         */
+        if (nf.notification.largeIcon != null || nf.notification.extras.containsKey("android.messages")) {
             moduleStyledIcons[iconView] = false
             return@runInSafe
         }
