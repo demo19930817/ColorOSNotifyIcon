@@ -1271,16 +1271,35 @@ object SystemUIHooker : YukiBaseHooker() {
                     swapConversationBadge(badgeDrawable, context, packageName, context.appIconOf(packageName))
                 }
             }
-            /** ColorOS 17：会话通知「头像+角标」合成点，合成完成即替换角标为单色图标（最早时机） */
+            /**
+             * ColorOS 17：会话通知「头像+角标」合成点
+             *
+             * createBackgroundWithAppIcon(context, 头像, 应用图标, packageName, size) 的第二个参数
+             * 即应用图标角标。在 before 中直接把它替换为单色图标，合成出的 [DrawableWithBadge]
+             * 从第一帧起就是单色角标，彻底消除「原始图标 → 单色」的渐变过渡（此前靠 after/延迟
+             * 兜底替换，中间会闪现原始角标）
+             */
             LayerDrawableWithAppIconKtClass?.resolve()?.optional()?.apply {
                 firstMethodOrNull {
                     name = "createBackgroundWithAppIcon"
-                }?.hook()?.after {
-                    val badgeDrawable = result as? Drawable ?: return@after
-                    if (DrawableWithBadgeClass?.isInstance(badgeDrawable) != true) return@after
-                    val context = args().first().cast<Context>() ?: return@after
-                    val packageName = args(index = 3).any() as? String ?: return@after
-                    swapConversationBadge(badgeDrawable, context, packageName, context.appIconOf(packageName))
+                }?.hook()?.before {
+                    val context = args().first().cast<Context>() ?: return@before
+                    val packageName = args(index = 3).any() as? String ?: return@before
+                    val originalBadge = args(index = 2).any() as? Drawable ?: return@before
+                    /** 已替换过（arg2 是 CustomIconDrawable）则跳过，防止重复 */
+                    if (originalBadge is CustomIconDrawable) return@before
+                    val customTriple = compatCustomIcon(context, isGrayscaleIcon = false, packageName = packageName)
+                    val glyph = customTriple.first ?: originalBadge
+                    val badgeColor = customTriple.second.takeIf { it != 0 } ?: 0xFFFFFFFF.toInt()
+                    val mono = CustomIconDrawable(
+                        glyph = glyph,
+                        badgeColor = badgeColor,
+                        glyphColor = Color.WHITE,
+                        cornerRadiusPx = ConfigData.notifyIconCornerSize.dpFloat(context),
+                        paddingRatio = NOTIFY_ICON_PADDING_RATIO_MD3
+                    )
+                    mono.setBounds(originalBadge.bounds)
+                    args(index = 2).set(mono)
                 }
             }
 
