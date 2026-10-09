@@ -764,6 +764,8 @@ object SystemUIHooker : YukiBaseHooker() {
     private fun styleHeaderIcon(headerWrapperExImp: Any?) = runInSafe {
         val base = headerWrapperExImp?.let { XposedHelpers.callMethod(it, "getBase") } ?: return@runInSafe
         val iconView = XposedHelpers.getObjectField(base, "mIcon") as? ImageView ?: return@runInSafe
+        /** 会话通知的 mIcon 是系统合成 [DrawableWithBadge]（头像+角标），直接跳过，角标单色化由 swapConversationBadge 处理 */
+        if (DrawableWithBadgeClass?.isInstance(iconView.drawable) == true) return@runInSafe
         val row = NotificationViewWrapperClass.resolve().optional().firstFieldOrNull { name = "mRow" }?.of(base)?.get()
         val nf = ExpandableNotificationRowClass.resolve().optional().firstMethodOrNull { name = "getEntry" }
             ?.of(row)?.invokeQuietly()?.let {
